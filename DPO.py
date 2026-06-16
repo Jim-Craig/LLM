@@ -9,6 +9,14 @@ import os
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only GPU 0
 
+#Since the preference dataset has a different structure, we need to format it similarly to the TL;DR dataset for training. The following function will help us achieve that.
+def format_like_tldr(example):
+    prompt = "SUBREDDIT: r/" + example["info"]["subreddit"] + " \nTITLE: " + example["info"]["title"] + " \nPOST: " + example["info"]["post"] + " \nTL;DR: "
+    text1 = {"prompt": prompt, "completion": example["summaries"][0]["text"]}
+    text2 = {"prompt": prompt, "completion": example["summaries"][1]["text"]}
+    choice = example["choice"]
+    return {"text1": text1, "text2": text2, "choice": choice}
+
 #Let's create a Dataset from the preference dataset that is formatted like the TL;DR dataset. This will allow us to use the same training pipeline for both datasets.
 class PreferenceDataset(Dataset):
     def __init__(self, dataset):
@@ -36,8 +44,7 @@ def get_logProbsRatio(text, dpo_model, sft_model,tokenizer, device):
         prompt_len = tokens_prompt["input_ids"].shape[1]
         label_len = tokens_label["input_ids"].shape[1]
         # Get the model's output logits for the label tokens given the prompt tokens for both the SFT and DPO models
-        sft_model.eval()
-        dpo_model.eval()
+        
         with torch.no_grad():
                 output_sft = sft_model(**tokens)
         output_dpo = dpo_model(**tokens)
@@ -61,20 +68,12 @@ def get_logProbsRatio(text, dpo_model, sft_model,tokenizer, device):
 
         return log_probs_dpo - log_probs_sft 
 
-#Since the preference dataset has a different structure, we need to format it similarly to the TL;DR dataset for training. The following function will help us achieve that.
-def format_like_tldr(example):
-    prompt = "SUBREDDIT: r/" + example["info"]["subreddit"] + " \nTITLE: " + example["info"]["title"] + " \nPOST: " + example["info"]["post"] + " \nTL;DR: "
-    text1 = {"prompt": prompt, "completion": example["summaries"][0]["text"]}
-    text2 = {"prompt": prompt, "completion": example["summaries"][1]["text"]}
-    choice = example["choice"]
-    return {"text1": text1, "text2": text2, "choice": choice}
-
 def DPO_Loss(example, beta, dpo_model, sft_model, tokenizer, device):
     choice = example["choice"]
     log_probs_diff1 = get_logProbsRatio(example["text1"], dpo_model=dpo_model, sft_model=sft_model, tokenizer=tokenizer, device=device)
     log_probs_diff2 = get_logProbsRatio(example["text2"], dpo_model=dpo_model, sft_model=sft_model, tokenizer=tokenizer, device=device)
     sign = [1 if c == 0 else -1 for c in choice]
-    loss = -torch.log(torch.sigmoid(beta * torch.tensor(sign).to(device) * (log_probs_diff1 - log_probs_diff2)))
+    loss = -torch.log(torch.sigmoid(beta * torch.tensor(sign, dtype=torch.float32).to(device) * (log_probs_diff1 - log_probs_diff2)))
 
     return loss.mean()
 
@@ -97,9 +96,10 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
         param.requires_grad = False
         
     for epoch in range(num_epochs):
+        sft_model.eval()
         dpo_model.train()
         total_loss = []
-        for batch in train_dataloader:
+        for batch_idx, batch in enumerate(train_dataloader):
             optimizer.zero_grad()
             loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
             loss.backward()
@@ -107,7 +107,7 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
             optimizer.step()
             scheduler.step()
             total_loss.append(loss.item())
-            break
+            print(f"Epoch {epoch+1}/{num_epochs}, Batch Number {batch_idx}: Batch Loss: {loss.item():.4f}")
 
         avg_loss = sum(total_loss) / len(total_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}")
@@ -116,10 +116,9 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
         dpo_model.eval()
         with torch.no_grad():
             val_loss = []
-            for batch in validation_dataloader:
+            for batch_idx, batch in enumerate(validation_dataloader):
                 loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
                 val_loss.append(loss.item())
-                break
 
         avg_val_loss = sum(val_loss) / len(val_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
