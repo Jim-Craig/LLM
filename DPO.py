@@ -80,95 +80,29 @@ def DPO_Loss(example, beta, dpo_model, sft_model, tokenizer, device):
 
 #Let's define the training loop for DPO. We will iterate through the preference dataset, compute the DPO loss for each example, and update the model parameters accordingly. 
 # We will also evaluate the model on the validation set after each epoch to monitor its performance.
-# def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, device, beta=0.5, num_epochs=3):
-#     dpo_model = copy.deepcopy(sft_model).to(device)
-#     # optimizer = torch.optim.RMSprop(dpo_model.parameters(), lr=1e-6)
-#     optimizer = torch.optim.AdamW(dpo_model.parameters(), lr=1e-6)
-#     scheduler = LinearLR(
-#     optimizer,
-#     start_factor=1e-9,   # effectively starts near 0 (1e-9 * 1e-6 ≈ 0)
-#     end_factor=1.0,       # ends at full lr (1.0 * 1e-6 = 1e-6)
-#     total_iters=150
-# )
-#     sft_model.eval()  # Set SFT model to eval mode since it's not being updated
-#     for param in sft_model.parameters():
-#         param.requires_grad = False
-        
-#     for epoch in range(num_epochs):
-#         dpo_model.train()
-#         total_loss = []
-#         for batch in train_dataloader:
-#             optimizer.zero_grad()
-#             loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
-#             loss.backward()
-#             torch.nn.utils.clip_grad_norm_(dpo_model.parameters(), max_norm=1.0)
-#             optimizer.step()
-#             scheduler.step()
-#             total_loss.append(loss.item())
-#             break
-
-#         avg_loss = sum(total_loss) / len(total_loss)
-#         print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}")
-
-#         # Validation loop
-#         dpo_model.eval()
-#         with torch.no_grad():
-#             val_loss = []
-#             for batch in validation_dataloader:
-#                 loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
-#                 val_loss.append(loss.item())
-#                 break
-
-#         avg_val_loss = sum(val_loss) / len(val_loss)
-#         print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
-#     # Free up memory after training
-#     del optimizer
-#     del scheduler
-
-#     return dpo_model
 def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, device, beta=0.5, num_epochs=3):
-    sft_model = sft_model.to(torch.bfloat16)
-    dpo_model = copy.deepcopy(sft_model).to(torch.bfloat16).to(torch.device)
-    
-    # Freeze sft_model explicitly
-    sft_model.eval()
+    sft_model = sft_model.to(dtype=torch.bfloat16, device=device)
+    dpo_model = copy.deepcopy(sft_model)
+
+    # optimizer = torch.optim.RMSprop(dpo_model.parameters(), lr=1e-6)
+    optimizer = torch.optim.AdamW(dpo_model.parameters(), lr=1e-6)
+    scheduler = LinearLR(
+    optimizer,
+    start_factor=1e-9,   # effectively starts near 0 (1e-9 * 1e-6 ≈ 0)
+    end_factor=1.0,       # ends at full lr (1.0 * 1e-6 = 1e-6)
+    total_iters=150
+)
+    sft_model.eval()  # Set SFT model to eval mode since it's not being updated
     for param in sft_model.parameters():
         param.requires_grad = False
-
-    optimizer = torch.optim.AdamW(dpo_model.parameters(), lr=1e-6)
-    scheduler = LinearLR(optimizer, start_factor=1e-9, end_factor=1.0, total_iters=150)
-
+        
     for epoch in range(num_epochs):
         dpo_model.train()
         total_loss = []
         for batch in train_dataloader:
             optimizer.zero_grad()
             loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
-            
-            # ── Diagnostics ──────────────────────────────────────────
-            print(f"Loss value: {loss.item()}")
-            print(f"Loss is nan: {torch.isnan(loss)}")
-            
-            # Check log prob ratios directly
-            log_ratio1 = get_logProbsRatio(batch["text1"], dpo_model, sft_model, tokenizer, device)
-            log_ratio2 = get_logProbsRatio(batch["text2"], dpo_model, sft_model, tokenizer, device)
-            print(f"log_ratio1: {log_ratio1}")
-            print(f"log_ratio2: {log_ratio2}")
-            
-            # Check model weights for NaN
-            for name, param in dpo_model.named_parameters():
-                if torch.isnan(param).any():
-                    print(f"NaN in weights: {name}")
-                    break
-            
             loss.backward()
-            
-            # Check gradients for NaN
-            for name, param in dpo_model.named_parameters():
-                if param.grad is not None and torch.isnan(param.grad).any():
-                    print(f"NaN in gradient: {name}")
-                    break
-            
             torch.nn.utils.clip_grad_norm_(dpo_model.parameters(), max_norm=1.0)
             optimizer.step()
             scheduler.step()
@@ -178,6 +112,7 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
         avg_loss = sum(total_loss) / len(total_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}")
 
+        # Validation loop
         dpo_model.eval()
         with torch.no_grad():
             val_loss = []
@@ -188,9 +123,12 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
 
         avg_val_loss = sum(val_loss) / len(val_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
+    # Free up memory after training
+    del optimizer
+    del scheduler
 
-    del optimizer, scheduler
     return dpo_model
+
 if __name__ == "__main__":
     # Load the preference dataset
     preferences_dataset = load_dataset("openai/summarize_from_feedback", "comparisons")
