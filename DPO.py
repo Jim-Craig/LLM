@@ -6,15 +6,16 @@ import torch
 import copy
 from torch.optim.lr_scheduler import LinearLR
 import os
+from tqdm import tqdm
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only GPU 0
 
 #Since the preference dataset has a different structure, we need to format it similarly to the TL;DR dataset for training. The following function will help us achieve that.
 def format_like_tldr(example):
-    prompt = "SUBREDDIT: r/" + example["info"]["subreddit"] + " \nTITLE: " + example["info"]["title"] + " \nPOST: " + example["info"]["post"] + " \nTL;DR: "
-    text1 = {"prompt": prompt, "completion": example["summaries"][0]["text"]}
-    text2 = {"prompt": prompt, "completion": example["summaries"][1]["text"]}
-    choice = example["choice"]
+    prompt = "SUBREDDIT: r/" + example.get("info", {}).get("subreddit", "") + " \nTITLE: " + example.get("info", {}).get("title", "") + " \nPOST: " + example.get("info", {}).get("post", "") + " \nTL;DR: "
+    text1 = {"prompt": prompt, "completion": example.get("summaries", [{}])[0].get("text", "")}
+    text2 = {"prompt": prompt, "completion": example.get("summaries", [{}])[1].get("text", "")}
+    choice = example.get("choice", 0)
     return {"text1": text1, "text2": text2, "choice": choice}
 
 #Let's create a Dataset from the preference dataset that is formatted like the TL;DR dataset. This will allow us to use the same training pipeline for both datasets.
@@ -77,6 +78,18 @@ def DPO_Loss(example, beta, dpo_model, sft_model, tokenizer, device):
 
     return loss.mean()
 
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, checkpoint_dir="./checkpoints"):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint.pt")
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+    }, checkpoint_path)
+    print(f"Checkpoint saved at {checkpoint_path}")
+
 #Let's define the training loop for DPO. We will iterate through the preference dataset, compute the DPO loss for each example, and update the model parameters accordingly. 
 # We will also evaluate the model on the validation set after each epoch to monitor its performance.
 def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, device, beta=0.5, num_epochs=3):
@@ -90,16 +103,20 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
     start_factor=1e-9,   # effectively starts near 0 (1e-9 * 1e-6 ≈ 0)
     end_factor=1.0,       # ends at full lr (1.0 * 1e-6 = 1e-6)
     total_iters=150
-)
-    sft_model.eval()  # Set SFT model to eval mode since it's not being updated
+    )
+    #Since we don't want to update the SFT model during DPO training, we set it to evaluation mode and disable gradient updates for its parameters. The DPO model will be updated 
+    # based on the computed loss and have disabled the batch normalization and dropout layers to ensure consistent behavior with the SFT model during training. This is important
+    #  because the DPO loss relies on the outputs of both models, and we want to ensure that the SFT model's behavior remains stable throughout the training process.
+    sft_model.eval()
+    dpo_model.eval()  
     for param in sft_model.parameters():
         param.requires_grad = False
-        
+    val_loss_checkpoint = float('inf')
     for epoch in range(num_epochs):
-        sft_model.eval()
-        dpo_model.train()
+        
         total_loss = []
-        for batch_idx, batch in enumerate(train_dataloader):
+        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        for batch_idx, batch in enumerate(pbar):
             optimizer.zero_grad()
             loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
             loss.backward()
@@ -107,20 +124,22 @@ def train_dpo(sft_model, train_dataloader, validation_dataloader, tokenizer, dev
             optimizer.step()
             scheduler.step()
             total_loss.append(loss.item())
-            print(f"Epoch {epoch+1}/{num_epochs}, Batch Number {batch_idx}: Batch Loss: {loss.item():.4f}")
 
         avg_loss = sum(total_loss) / len(total_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}")
 
         # Validation loop
-        dpo_model.eval()
         with torch.no_grad():
             val_loss = []
-            for batch_idx, batch in enumerate(validation_dataloader):
+            pbar = tqdm(validation_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation")
+            for batch_idx, batch in enumerate(pbar):
                 loss = DPO_Loss(batch, beta, dpo_model, sft_model, tokenizer, device)
                 val_loss.append(loss.item())
-
+                
         avg_val_loss = sum(val_loss) / len(val_loss)
+        if(avg_val_loss < val_loss_checkpoint):
+            val_loss_checkpoint = avg_val_loss
+            save_checkpoint(dpo_model, optimizer, scheduler, epoch, avg_val_loss)
         print(f"Epoch {epoch+1}/{num_epochs}, Validation Loss: {avg_val_loss:.4f}")
     # Free up memory after training
     del optimizer
@@ -134,9 +153,10 @@ if __name__ == "__main__":
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = AutoModelForCausalLM.from_pretrained("./qwen-tldr-sft-merged_2", torch_dtype=torch.float16).to(device)
     tokenizer = AutoTokenizer.from_pretrained("./qwen-tldr-sft-merged_2") 
-
+    validation_dataset = [example for example in preferences_dataset["validation"] if example["info"]["site"] is None]
+    
     train_pref_dataset = PreferenceDataset(preferences_dataset["train"])
-    validation_pref_dataset = PreferenceDataset(preferences_dataset["validation"])
+    validation_pref_dataset = PreferenceDataset(validation_dataset)
 
     train_dataloader = torch.utils.data.DataLoader(train_pref_dataset, batch_size=4, shuffle=True)
     validation_dataloader = torch.utils.data.DataLoader(validation_pref_dataset, batch_size=4)
