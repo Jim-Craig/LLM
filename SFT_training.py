@@ -12,21 +12,46 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use only GPU 0
 
 # Step 1: Format + Tokenize
 def format_and_tokenize(example):
-    result = tokenizer(
-        example["prompt"] + example["label"],
+    prompt = example["prompt"]
+    summary = example["label"]
+
+
+    full_text = prompt + summary + tokenizer.eos_token  # Ensure EOS token is added
+
+    # Tokenize full sequence
+    tokenized = tokenizer(
+        full_text,
         truncation=True,
         max_length=550,
         padding="max_length",
     )
-    result["labels"] = result["input_ids"].copy()
-    return result
+
+    # Tokenize prompt separately to determine where summary starts
+    prompt_tokens = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=550,
+        add_special_tokens=False,
+    )
+
+    prompt_len = len(prompt_tokens["input_ids"])
+
+    labels = tokenized["input_ids"].copy()
+
+    # Ignore prompt tokens during loss computation
+    labels[:prompt_len] = [-100] * prompt_len
+
+    tokenized["labels"] = labels
+
+    return tokenized
+
 
 if __name__ == "__main__":
     tldr_dataset = load_dataset("CarperAI/openai_summarize_tldr")
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     checkpoint_dir = "/home/godwinkhalko/LLMs/qwen-tldr-sft-merged"
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained("./qwen-tldr-sft-merged", torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.float16)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
@@ -73,7 +98,8 @@ if __name__ == "__main__":
         remove_unused_columns=False,
         # Add these to prevent overfitting with more epochs
         warmup_ratio=0.1,
-        weight_decay=0.01
+        weight_decay=0.01,
+        learning_rate=2e-5
         )
 
     data_collator = DataCollatorForLanguageModeling(
