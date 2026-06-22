@@ -151,8 +151,8 @@ if __name__ == "__main__":
     # Load the preference dataset
     preferences_dataset = load_dataset("openai/summarize_from_feedback", "comparisons")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model = AutoModelForCausalLM.from_pretrained("./qwen-tldr-sft-merged_2", torch_dtype=torch.float16).to(device)
-    tokenizer = AutoTokenizer.from_pretrained("./qwen-tldr-sft-merged_2") 
+    model = AutoModelForCausalLM.from_pretrained("./qwen-tldr-sft-merged", torch_dtype=torch.float16).to(device)
+    tokenizer = AutoTokenizer.from_pretrained("./qwen-tldr-sft-merged") 
     validation_dataset = [example for example in preferences_dataset["validation"] if example["info"]["site"] is None]
     
     train_pref_dataset = PreferenceDataset(preferences_dataset["train"])
