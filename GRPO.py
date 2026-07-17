@@ -1,4 +1,4 @@
-from random import random
+import random
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -75,7 +75,7 @@ def reward_model(model_output, correct_answer, alpha=0.5):
         model_answer = model_output[answer_start + len("<answer>"):answer_end].strip()
         
         # Check if the model's answer matches the correct answer
-        if str(model_answer) == str(correct_answer.item()):
+        if str(model_answer) == str(correct_answer):
             answer_score = 1  # Reward of 1 for correct format and correct answer
     return alpha * template_score + (1 - alpha) * answer_score  # Reward of 0 for incorrect format or incorrect answer
 
@@ -90,15 +90,18 @@ def GRPO_Loss(model_theta,model_old, model_ref, inputs, outputs, advantages, dev
             "attention_mask": torch.ones_like(output).to(device),
         }
         answer_len = output.shape[1] - prompt_len
-        with torch.no_grad():
-            model_ref_output = model_ref(**tokens)
-            model_old_output = model_old(**tokens)
-        model_theta_output = model_theta(**tokens)
+        
+         # Forward passes run in bf16 via autocast for memory/speed.
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with torch.no_grad():
+                model_ref_output = model_ref(**tokens)
+                model_old_output = model_old(**tokens)
+            model_theta_output = model_theta(**tokens)
 
         #Extract the logits corresponding to the answer tokens for each model
-        answer_logits_theta = model_theta_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :]
-        answer_logits_ref = model_ref_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :]
-        answer_logits_old = model_old_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :]
+        answer_logits_theta = model_theta_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :].float()
+        answer_logits_ref = model_ref_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :].float()
+        answer_logits_old = model_old_output.logits[:, prompt_len - 1: prompt_len - 1 + answer_len, :].float()
 
         #Compute the probabilities for the answer tokens using softmax
         answer_log_probs_theta = F.log_softmax(answer_logits_theta, dim=-1)
@@ -113,9 +116,15 @@ def GRPO_Loss(model_theta,model_old, model_ref, inputs, outputs, advantages, dev
         answer_token_log_probs_ref = answer_log_probs_ref.gather(2, answer_tokens).squeeze(-1)
         answer_token_log_probs_old = answer_log_probs_old.gather(2, answer_tokens).squeeze(-1)
 
+        # log-ratios computed in fp32, clamped before exp() to avoid overflow
+        # if theta and old/ref diverge a lot early in training.
+        log_ratio_ref_theta = torch.clamp(answer_token_log_probs_ref - answer_token_log_probs_theta, min=-20, max=20)
+        log_ratio_theta_old = torch.clamp(answer_token_log_probs_theta - answer_token_log_probs_old, min=-20, max=20)
+
+
         #Get the probablity ratios of the answer tokens for the theta model with respect to the reference and old models
-        ratio_ref_theta = torch.exp(answer_token_log_probs_ref - answer_token_log_probs_theta)
-        ratio_theta_old = torch.exp(answer_token_log_probs_theta - answer_token_log_probs_old)
+        ratio_ref_theta = torch.exp(log_ratio_ref_theta)
+        ratio_theta_old = torch.exp(log_ratio_theta_old)
 
         #Copmute the GRPO CLIP value for ratio_theta_old
         clip = torch.clamp(
@@ -134,12 +143,16 @@ def GRPO_Loss(model_theta,model_old, model_ref, inputs, outputs, advantages, dev
         #Sum the policy_loss and KL-Divergence
         output_sum = policy_loss - beta * kl_divergence
         total_output.append(output_sum.mean())  # Normalize by the length of the answer
-    grpo_loss = -np.mean(total_output)  # Average over all outputs
+    # Keep this as a torch stack/mean rather than np.mean over tensors —
+    # np.mean() on a list of tensors with grad_fn will silently break
+    # the autograd graph (it forces a numpy conversion under the hood
+    # via __array__, detaching gradients). Use torch.stack().mean() instead.
+    grpo_loss = -torch.stack(total_output).mean()
 
     
     return grpo_loss
 
-def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, learning_rate=1e-6, alpha=0.5, device="cuda:1", num_return_sequences=5, grpo_update_iters = 10):
+def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, alpha=0.5, device="cuda:1", num_return_sequences=5, grpo_update_iters = 10):
     #Prompst and correct_answer would be of the dimension (batch_size,) for the data loader. The prompt is a string and the correct_answer is an integer.
     prompt, correct_answer = dataset[random.randint(0, len(dataset) - 1)]  # sample directly from dataset
     # Tokenize the prompt
@@ -150,13 +163,15 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, learning_ra
 
     # Generate model output from the old model as per the number of return sequences specified
     #outputs 
-    with torch.no_grad():
-        outputs = model_old.generate(input_ids=input_ids, 
-                                     attention_mask=attention_mask,
-                                     max_length=200, 
-                                     num_return_sequences=num_return_sequences, 
-                                     do_sample=True, 
-                                     temperature=1.0)
+     # Forward passes run in bf16 via autocast for memory/speed.
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.no_grad():
+            outputs = model_old.generate(input_ids=input_ids, 
+                                        attention_mask=attention_mask,
+                                        max_length=200, 
+                                        num_return_sequences=num_return_sequences, 
+                                        do_sample=True, 
+                                        temperature=1.0)
     #Calculate the reward for each output based on the correct answer and the alpha value
     rewards = []
     model_outputs = []
@@ -170,12 +185,10 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, learning_ra
     mean_reward = np.mean(rewards)
     std_reward = np.std(rewards)
     advantages = [(r - mean_reward) / (std_reward + 1e-8) for r in rewards]
-    
-    optimizer = torch.optim.Adam(model_theta.parameters(), lr=learning_rate)
-
     scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=grpo_update_iters)
     model_old.eval()
     model_ref.eval()
+    model_theta.train()
     for i in range(grpo_update_iters):
         optimizer.zero_grad()
         grpo_loss = GRPO_Loss(model_theta, model_old, model_ref, inputs, outputs, advantages, device=device)
@@ -190,19 +203,18 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, learning_ra
 def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_return_sequences=5, grpo_update_iters=5, learning_rate=1e-5, device="cuda:1", ):
     dataset = ArthimaticAddition(num_samples=10000)
     # data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     for i in range(epochs):
         model_ref = copy.deepcopy(model)
-        model_ref.to(device)
+        model_ref.to(dtype = torch.bfloat16, device=device)
         print(f"Epoch {i+1}/{epochs}")
         for j in range(num_iterations):
             model_old = copy.deepcopy(model)
-            model_old.to(device)
+            model_old.to(dtype = torch.bfloat16, device=device)
             print(f"Iteration {j+1}/{num_iterations}")
-            model = GRPO_Loop(model_old, model_ref, model, dataset, tokenizer, learning_rate=learning_rate, alpha=alpha, device=device, num_return_sequences=num_return_sequences, grpo_update_iters=grpo_update_iters)
+            model = GRPO_Loop(model_old, model_ref, model, dataset, tokenizer, optimizer, alpha=alpha, device=device, num_return_sequences=num_return_sequences, grpo_update_iters=grpo_update_iters)
     del model_ref
     del model_old
-    del optimizer
-    del data_loader
     del dataset
 
     return model
@@ -210,7 +222,7 @@ def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_re
 if __name__ == "__main__":
     #Let's start with a base Quen 2.5 0.5B instruct model
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.float16)
+    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.bfloat16)
     device = "cuda:1" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
