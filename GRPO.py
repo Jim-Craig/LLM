@@ -11,42 +11,74 @@ import os
 from tqdm import tqdm
 import numpy as np
 import torch.nn.functional as F
+import re
+import random
+import torch
+from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
 
-#Define a custom dataset class to handle the data. The data in this case is a simple arithmatic addition. 
-# We'll randomly generate 2 numbers between 0-100 and generate the answer, in this case addition of the 2 numbers. 
-# The prompt will be in the following format:
-# You are a reasoning assistant.
 
-# Solve the following problem.
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)  # harmless even if val_dataset generation is on CPU
 
-# Respond in exactly this format.
+class MultiOperandArithmetic(Dataset):
+    """4 random integers, 3 random operators (+, -, *; no division), with a
+    randomly chosen bracket pattern. Intended for GRPO — only prompt + ground
+    truth answer are produced; no reasoning trace is templated, since the
+    point is to let the model discover correct precedence handling via
+    reward rather than imitate a scripted solution."""
 
-# <think>
-# Your reasoning
-# </think>
+    OPS = ("+", "-", "*")
 
-# <answer>
-# Final answer
-# </answer>
+    # A handful of valid parenthesization patterns for 4 operands / 3 ops.
+    # {a},{b},{c},{d} = operands, {op1},{op2},{op3} = operators, in order.
+    BRACKET_PATTERNS = [
+        "{a} {op1} {b} {op2} {c} {op3} {d}",              # no brackets
+        "({a} {op1} {b}) {op2} {c} {op3} {d}",
+        "{a} {op1} ({b} {op2} {c}) {op3} {d}",
+        "{a} {op1} {b} {op2} ({c} {op3} {d})",
+        "({a} {op1} {b} {op2} {c}) {op3} {d}",
+        "{a} {op1} ({b} {op2} {c} {op3} {d})",
+        "({a} {op1} {b}) {op2} ({c} {op3} {d})",
+        "(({a} {op1} {b}) {op2} {c}) {op3} {d}",
+        "{a} {op1} (({b} {op2} {c}) {op3} {d})",
+    ]
 
-# Question:
-
-class ArthimaticAddition(Dataset):
-    def __init__(self, num_samples=1000):
+    def __init__(self, num_samples=1000, low=0, high=20):
         self.num_samples = num_samples
         self.data = []
         for _ in range(num_samples):
-            a = torch.randint(0, 100, (1,)).item()
-            b = torch.randint(0, 100, (1,)).item()
-            answer = a + b
-            prompt = f"You are a reasoning assistant.\n\nSolve the following problem.\n\nRespond in exactly this format.\n\n<think>\nYour reasoning\n</think>\n\n<answer>\nFinal answer\n</answer>\n\nQuestion: What is {a} + {b}?"
-            self.data.append((prompt, answer))
+            nums = [torch.randint(low, high, (1,)).item() for _ in range(4)]
+            ops = [random.choice(self.OPS) for _ in range(3)]
+            pattern = random.choice(self.BRACKET_PATTERNS)
+
+            expr = pattern.format(
+                a=nums[0], b=nums[1], c=nums[2], d=nums[3],
+                op1=ops[0], op2=ops[1], op3=ops[2],
+            )
+
+            # Ground truth computed from the exact same string the model sees,
+            # so precedence/bracket handling is guaranteed self-consistent —
+            # never hand-derived separately from the displayed expression.
+            answer = eval(expr)
+
+            prompt = (
+                "You are a reasoning assistant.\n\nSolve the following problem.\n\n"
+                "Respond in exactly this format.\n\n<think>\nYour reasoning\n</think>\n\n"
+                f"<answer>\nFinal answer\n</answer>\n\nQuestion: What is {expr}?"
+            )
+
+            self.data.append({"prompt": prompt, "answer": answer, "expression": expr})
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        item = self.data[idx]
+        return item["prompt"], item["answer"]
 
 
 #Now we define a deterministic reward template function that will give a reward of 1 if the model's answer is in the correct format else 0. The correct format is as follows:
@@ -69,15 +101,31 @@ def reward_model(model_output, correct_answer, alpha=0.5):
         answer_end = model_output.find("</answer>")
         # print(think_start, think_end, answer_start, answer_end)
         #Make sure that the <think> and <answer> tags are in the correct order and output positvely starts with <think> and ends with </answer>
-        if think_start == 0 and (think_start < think_end < answer_start < answer_end) and answer_end == len(model_output) - len("</answer>"):
-            template_score = 1
+        stripped = model_output.lstrip()
+        if stripped.startswith("<think>"):
+            template_score += 0.25
+        if think_start < think_end < answer_start < answer_end:
+            template_score +=0.25  
+        between_think_and_answer = model_output[think_end + len("</think>"):answer_start]
+        if think_start == 0 and re.fullmatch(r"\s*", between_think_and_answer):
+            template_score += 0.25
+        if answer_end == len(model_output) - len("</answer>"):
+            template_score += 0.25  
         # Extract the answer from the model output
         model_answer = model_output[answer_start + len("<answer>"):answer_end].strip()
         
-        # Check if the model's answer matches the correct answer
-        if str(model_answer) == str(correct_answer):
-            answer_score = 1  # Reward of 1 for correct format and correct answer
-    return alpha * template_score + (1 - alpha) * answer_score  # Reward of 0 for incorrect format or incorrect answer
+        # # Check if the model's answer matches the correct answer
+        # if str(model_answer) == str(correct_answer):
+        #     answer_score = 1  # Reward of 1 for correct format and correct answer
+        model_answer_raw = model_output[answer_start + len("<answer>"):answer_end].strip()
+        try:
+            model_answer = int(model_answer_raw)
+            answer_score = max(0, 1 - abs(model_answer - correct_answer) / (abs(correct_answer) + 1))
+        except ValueError:
+            answer_score = 0  # not a clean bare integer — correctly penalized, format discipline not yet learned
+            print(model_answer)
+    # print(f"Model Output: {model_output} | Template Score: {template_score} | Answer Score: {answer_score}")
+    return template_score, answer_score # Return both scores
 
 def GRPO_Loss(model_theta,model_old, model_ref, inputs, outputs, advantages, device="cuda:1", epsilon=0.2, beta=0.04):
     # Concatenate the prompt and label tokens for the model input
@@ -152,7 +200,7 @@ def GRPO_Loss(model_theta,model_old, model_ref, inputs, outputs, advantages, dev
     
     return grpo_loss
 
-def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, alpha=0.5, device="cuda:1", num_return_sequences=5, grpo_update_iters = 10):
+def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, alpha=0.5, device="cuda:0", num_return_sequences=5, grpo_update_iters = 10):
     #Prompst and correct_answer would be of the dimension (batch_size,) for the data loader. The prompt is a string and the correct_answer is an integer.
     prompt, correct_answer = dataset[random.randint(0, len(dataset) - 1)]  # sample directly from dataset
     # Tokenize the prompt
@@ -177,7 +225,8 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, 
     model_outputs = []
     for output in outputs:
         model_output = tokenizer.decode(output[input_ids.shape[1]:], skip_special_tokens=True)
-        reward = reward_model(model_output, correct_answer, alpha)
+        template_score, answer_score = reward_model(model_output, correct_answer, alpha)
+        reward = alpha * template_score + (1 - alpha) * answer_score
         rewards.append(reward)
         model_outputs.append(model_output)
 
@@ -185,25 +234,34 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, 
     mean_reward = np.mean(rewards)
     std_reward = np.std(rewards)
     advantages = [(r - mean_reward) / (std_reward + 1e-8) for r in rewards]
-    scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=grpo_update_iters)
+
+    print(f"rewards: {rewards}")
+    print(f"advantages: {advantages}")
+    # scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=grpo_update_iters)
     model_old.eval()
     model_ref.eval()
     model_theta.train()
     for i in range(grpo_update_iters):
         optimizer.zero_grad()
         grpo_loss = GRPO_Loss(model_theta, model_old, model_ref, inputs, outputs, advantages, device=device)
-        print(f"GRPO Loss at update Number {i+1}: {grpo_loss.item()}")
         grpo_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model_theta.parameters(), max_norm=1.0)
+        grad_norm = sum(p.grad.norm().item() for p in model_theta.parameters() if p.grad is not None)
+        # print(f"GRPO Loss at update {i+1}: {grpo_loss.item()}  |  grad_norm: {grad_norm}")
         optimizer.step()
-        scheduler.step()
+        # scheduler.step()
 
     
     return model_theta
 
-def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_return_sequences=5, grpo_update_iters=5, learning_rate=1e-5, device="cuda:1", ):
-    dataset = ArthimaticAddition(num_samples=10000)
+def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_return_sequences=5, grpo_update_iters=5, learning_rate=1e-5, device="cuda:0", ):
+    dataset = MultiOperandArithmetic(num_samples=10000)
+    set_seed(42)  # fix the RNG state right before building val_dataset
+    val_dataset = MultiOperandArithmetic(num_samples=10)
     # data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
+    set_seed(random.randint(0, 2**31))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    validation_rewards = []
     for i in range(epochs):
         model_ref = copy.deepcopy(model)
         model_ref.to(dtype = torch.bfloat16, device=device)
@@ -213,21 +271,64 @@ def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_re
             model_old.to(dtype = torch.bfloat16, device=device)
             print(f"Iteration {j+1}/{num_iterations}")
             model = GRPO_Loop(model_old, model_ref, model, dataset, tokenizer, optimizer, alpha=alpha, device=device, num_return_sequences=num_return_sequences, grpo_update_iters=grpo_update_iters)
+            #evaluate the model on the validation dataset and print the average reward for the validation dataset
+            val_rewards = []
+            template_scores, answer_scores = [], []
+            for val_prompt, val_correct_answer in val_dataset:
+                val_inputs = tokenizer(val_prompt, return_tensors="pt").to(device)
+                val_input_ids = val_inputs["input_ids"]
+                val_attention_mask = val_inputs["attention_mask"]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with torch.no_grad():
+                        val_outputs = model.generate(input_ids=val_input_ids, 
+                                                    attention_mask=val_attention_mask,
+                                                    max_length=200, 
+                                                    num_return_sequences=num_return_sequences, 
+                                                    do_sample=True, 
+                                                    temperature=1.0)
+                for val_output in val_outputs:
+                    val_model_output = tokenizer.decode(val_output[val_input_ids.shape[1]:], skip_special_tokens=True)
+                    template_score, answer_score = reward_model(val_model_output, val_correct_answer, alpha)
+                    template_scores.append(template_score)
+                    answer_scores.append(answer_score)
+                    reward = alpha * template_score + (1 - alpha) * answer_score
+                    val_rewards.append(reward)
+            avg_template_score = np.mean(template_scores)
+            avg_answer_score = np.mean(answer_scores)
+            print(f"Average Validation Template Score after iteration {j+1}: {avg_template_score}")
+            print(f"Average Validation Answer Score after iteration {j+1}: {avg_answer_score}")
+            print(f"Average Validation Reward after iteration {j+1}: {np.mean(val_rewards)}")
+            validation_rewards.append(np.mean(val_rewards))
+
     del model_ref
     del model_old
     del dataset
-
-    return model
+    del val_dataset
+    return model, validation_rewards
 
 if __name__ == "__main__":
     #Let's start with a base Quen 2.5 0.5B instruct model
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.bfloat16)
-    device = "cuda:1" if torch.cuda.is_available() else "cpu"
+    checkpoint_path = "/home/godwinkhalko/LLMs/GRPO"
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
-    grpo_model = GRPO_Training(model, epochs=1, tokenizer=tokenizer, num_iterations=2, alpha=0.5, num_return_sequences=2, grpo_update_iters=2, learning_rate=1e-5, device=device)
+    grpo_model, validation_rewards = GRPO_Training(model, epochs=1, tokenizer=tokenizer, num_iterations=30, alpha=0.3, num_return_sequences=8, grpo_update_iters=3, learning_rate=1e-5, device=device)
 
+    #Compute the graph of the validation rewards over the iterations and save it as a png file
+    plt.plot(validation_rewards)
+    plt.xlabel("Iterations")
+    plt.ylabel("Average Validation Reward")
+    plt.title("Validation Reward over Iterations")
+    plt.savefig("/home/godwinkhalko/LLMs/validation_rewards.png")
+
+    #Save the model after training
+    save_path = "/home/godwinkhalko/LLMs/GRPO"
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    grpo_model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
     del model
     del grpo_model
     del tokenizer
