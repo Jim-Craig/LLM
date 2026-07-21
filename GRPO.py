@@ -89,7 +89,7 @@ class MultiOperandArithmetic(Dataset):
 #Final answer
 #</answer>
 
-def reward_model(model_output, correct_answer, alpha=0.5):
+def reward_model(model_output, correct_answer):
     template_score = 0
     answer_score = 0
     # Check if the model output contains the correct format
@@ -111,12 +111,37 @@ def reward_model(model_output, correct_answer, alpha=0.5):
             template_score += 0.25
         if answer_end == len(model_output) - len("</answer>"):
             template_score += 0.25  
-        # Extract the answer from the model output
-        model_answer = model_output[answer_start + len("<answer>"):answer_end].strip()
         
-        # # Check if the model's answer matches the correct answer
-        # if str(model_answer) == str(correct_answer):
-        #     answer_score = 1  # Reward of 1 for correct format and correct answer
+        model_answer_raw = model_output[answer_start + len("<answer>"):answer_end].strip()
+        try:
+            model_answer = int(model_answer_raw)
+            answer_score = max(0, 1 - abs(model_answer - correct_answer) / (abs(correct_answer) + 1))
+        except ValueError:
+            answer_score = 0  # not a clean bare integer — correctly penalized, format discipline not yet learned
+            print(model_answer)
+    # print(f"Model Output: {model_output} | Template Score: {template_score} | Answer Score: {answer_score}")
+    return template_score, answer_score # Return both scores
+
+def reward_model_binary(model_output, correct_answer):
+    template_score = 0
+    answer_score = 0
+    # Check if the model output contains the correct format
+    if "<think>" in model_output and "</think>" in model_output and "<answer>" in model_output and "</answer>" in model_output:
+        #Ensure that the <think> and <answer> tags are in the correct order
+        think_start = model_output.find("<think>")
+        think_end = model_output.find("</think>")
+        answer_start = model_output.find("<answer>")
+        answer_end = model_output.find("</answer>")
+        # print(think_start, think_end, answer_start, answer_end)
+        #Make sure that the <think> and <answer> tags are in the correct order and output positvely starts with <think> and ends with </answer>
+        stripped = model_output.lstrip()
+        between_think_and_answer = model_output[think_end + len("</think>"):answer_start]
+        if (stripped.startswith("<think>") 
+        and (think_start < think_end < answer_start < answer_end) 
+        and (think_start == 0 and re.fullmatch(r"\s*", between_think_and_answer))
+        and (answer_end == len(model_output) - len("</answer>"))):
+            template_score = 1.0
+        
         model_answer_raw = model_output[answer_start + len("<answer>"):answer_end].strip()
         try:
             model_answer = int(model_answer_raw)
@@ -225,7 +250,7 @@ def GRPO_Loop(model_old, model_ref, model_theta, dataset, tokenizer, optimizer, 
     model_outputs = []
     for output in outputs:
         model_output = tokenizer.decode(output[input_ids.shape[1]:], skip_special_tokens=True)
-        template_score, answer_score = reward_model(model_output, correct_answer, alpha)
+        template_score, answer_score = reward_model_binary(model_output, correct_answer, alpha)
         reward = alpha * template_score + (1 - alpha) * answer_score
         rewards.append(reward)
         model_outputs.append(model_output)
@@ -261,9 +286,11 @@ def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_re
     # data_loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=True)
     set_seed(random.randint(0, 2**31))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    validation_rewards = []
+    validation_rewards, template_scores, answer_scores = [], [], []
+    best_model = copy.deepcopy(model)
+    best_validation_reward = -float("inf")
     for i in range(epochs):
-        model_ref = copy.deepcopy(model)
+        model_ref = copy.deepcopy(best_model)
         model_ref.to(dtype = torch.bfloat16, device=device)
         print(f"Epoch {i+1}/{epochs}")
         for j in range(num_iterations):
@@ -288,33 +315,46 @@ def GRPO_Training(model, epochs, tokenizer, num_iterations=10, alpha=0.5, num_re
                                                     temperature=1.0)
                 for val_output in val_outputs:
                     val_model_output = tokenizer.decode(val_output[val_input_ids.shape[1]:], skip_special_tokens=True)
-                    template_score, answer_score = reward_model(val_model_output, val_correct_answer, alpha)
+                    template_score, answer_score = reward_model_binary(val_model_output, val_correct_answer, alpha)
                     template_scores.append(template_score)
                     answer_scores.append(answer_score)
                     reward = alpha * template_score + (1 - alpha) * answer_score
                     val_rewards.append(reward)
             avg_template_score = np.mean(template_scores)
             avg_answer_score = np.mean(answer_scores)
+            avg_val_reward = np.mean(val_rewards)
             print(f"Average Validation Template Score after iteration {j+1}: {avg_template_score}")
             print(f"Average Validation Answer Score after iteration {j+1}: {avg_answer_score}")
-            print(f"Average Validation Reward after iteration {j+1}: {np.mean(val_rewards)}")
-            validation_rewards.append(np.mean(val_rewards))
+            print(f"Average Validation Reward after iteration {j+1}: {avg_val_reward}")
+            validation_rewards.append(avg_val_reward)
+            template_scores.append(avg_template_score)
+            answer_scores.append(avg_answer_score)
+            if np.mean(val_rewards) > best_validation_reward:
+                best_validation_reward = np.mean(val_rewards)
+                best_model = copy.deepcopy(model)
+                checkpoint_path = "/home/godwinkhalko/LLMs/GRPO-checkpoint"
+                if not os.path.exists(checkpoint_path):
+                    os.makedirs(checkpoint_path)
+                best_model.save_pretrained(checkpoint_path)
+                tokenizer.save_pretrained(checkpoint_path)
+        if i == 0:
+            alpha = 0.3
 
     del model_ref
     del model_old
     del dataset
     del val_dataset
-    return model, validation_rewards
+    return best_model, validation_rewards, template_scores, answer_scores
 
 if __name__ == "__main__":
     #Let's start with a base Quen 2.5 0.5B instruct model
-    checkpoint_path = "/home/godwinkhalko/LLMs/GRPO"
+    checkpoint_path = "/home/godwinkhalko/LLMs/GRPO-sft-merged"
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
     model = AutoModelForCausalLM.from_pretrained(checkpoint_path, torch_dtype=torch.bfloat16)
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model.to(device)
 
-    grpo_model, validation_rewards = GRPO_Training(model, epochs=1, tokenizer=tokenizer, num_iterations=30, alpha=0.3, num_return_sequences=8, grpo_update_iters=3, learning_rate=1e-5, device=device)
+    grpo_model, validation_rewards, template_scores, answer_scores = GRPO_Training(model, epochs=1, tokenizer=tokenizer, num_iterations=30, alpha=0.5, num_return_sequences=8, grpo_update_iters=3, learning_rate=1e-5, device=device)
 
     #Compute the graph of the validation rewards over the iterations and save it as a png file
     plt.plot(validation_rewards)
@@ -322,6 +362,20 @@ if __name__ == "__main__":
     plt.ylabel("Average Validation Reward")
     plt.title("Validation Reward over Iterations")
     plt.savefig("/home/godwinkhalko/LLMs/validation_rewards.png")
+
+    #Compute the graph of the template scores over the iterations and save it as a png file
+    plt.plot(template_scores)
+    plt.xlabel("Iterations")
+    plt.ylabel("Average Validation Template Score")
+    plt.title("Validation Template Score over Iterations")
+    plt.savefig("/home/godwinkhalko/LLMs/template_scores.png")
+
+    #Compute the graph of the answer scores over the iterations and save it as a png file
+    plt.plot(answer_scores)
+    plt.xlabel("Iterations")
+    plt.ylabel("Average Validation Answer Score")
+    plt.title("Validation Answer Score over Iterations")
+    plt.savefig("/home/godwinkhalko/LLMs/answer_scores.png")
 
     #Save the model after training
     save_path = "/home/godwinkhalko/LLMs/GRPO"
